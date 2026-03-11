@@ -19,17 +19,18 @@ const API_URL = process.env.COOKCLAW_API_URL || 'http://host.docker.internal:300
 const BOT_ID = process.env.COOKCLAW_BOT_ID || '';
 const SECRET = process.env.COOKCLAW_SECRET || 'cookclaw-worker-2026';
 
-// 调用 CookClaw Hub 转发请求到 agent
+// 调用 Hub 转发请求到 agent
+// 兼容两种模式：CookClaw API (/api/agent/request + botId) 和独立 Hub (/request)
 function callAgent(action, params) {
   return new Promise((resolve, reject) => {
-    const data = JSON.stringify({
-      botId: BOT_ID,
-      action,
-      params: params || {},
-      secret: SECRET,
-    });
+    const isStandalone = !BOT_ID;
+    const data = JSON.stringify(isStandalone
+      ? { action, params: params || {}, secret: SECRET }
+      : { botId: BOT_ID, action, params: params || {}, secret: SECRET }
+    );
 
-    const parsed = new URL(API_URL + '/api/agent/request');
+    const endpoint = isStandalone ? '/request' : '/api/agent/request';
+    const parsed = new URL(API_URL + endpoint);
     const transport = parsed.protocol === 'https:' ? https : http;
 
     const req = transport.request({
