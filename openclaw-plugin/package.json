@@ -1,0 +1,12 @@
+{
+  "name": "cookclaw-remote-files",
+  "version": "0.1.0",
+  "description": "CookClaw Remote File Agent - 让 Bot 通过 WebSocket 访问用户电脑的文件和执行命令",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
