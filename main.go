@@ -3,11 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	_ "image/png"
 	"io"
 	"log"
+	"mime"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -22,11 +27,12 @@ import (
 )
 
 const (
-	Version          = "0.2.0"
-	MaxFileSize      = 10 * 1024 * 1024 // 10MB
-	HeartbeatEvery   = 30 * time.Second
-	ReconnectDelay   = 5 * time.Second
-	MaxSearchResults = 100
+	Version            = "0.3.0"
+	MaxFileSize        = 10 * 1024 * 1024 // 10MB
+	MaxUploadFileSize  = 50 * 1024 * 1024 // 50MB
+	HeartbeatEvery     = 30 * time.Second
+	ReconnectDelay     = 5 * time.Second
+	MaxSearchResults   = 100
 )
 
 // 黑名单：永远不能访问的文件/目录
@@ -489,6 +495,176 @@ func (a *Agent) execCommand(params json.RawMessage) interface{} {
 	}
 }
 
+// ─── 文件传输 ───
+
+func (a *Agent) uploadFile(params json.RawMessage) interface{} {
+	var p struct {
+		Path string `json:"path"`
+	}
+	json.Unmarshal(params, &p)
+
+	if p.Path == "" {
+		return map[string]string{"error": "路径不能为空"}
+	}
+
+	path, err := a.safePath(p.Path)
+	if err != nil {
+		return map[string]string{"error": a.sanitizeError(err.Error())}
+	}
+	if a.isBlacklisted(path) {
+		return map[string]string{"error": "访问被拒绝"}
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return map[string]string{"error": a.sanitizeError(err.Error())}
+	}
+	if info.IsDir() {
+		return map[string]string{"error": "这是一个目录，不能上传"}
+	}
+	if info.Size() > MaxUploadFileSize {
+		return map[string]string{"error": fmt.Sprintf("文件太大: %dMB，上限 %dMB", info.Size()/1024/1024, MaxUploadFileSize/1024/1024)}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]string{"error": a.sanitizeError(err.Error())}
+	}
+
+	// 检测 MIME 类型
+	ext := filepath.Ext(path)
+	mimeType := mime.TypeByExtension(ext)
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+
+	return map[string]interface{}{
+		"path":           a.relPath(path),
+		"name":           filepath.Base(path),
+		"size":           info.Size(),
+		"mime_type":      mimeType,
+		"content_base64": base64.StdEncoding.EncodeToString(data),
+	}
+}
+
+func (a *Agent) downloadFile(params json.RawMessage) interface{} {
+	if a.config.ReadOnly {
+		return map[string]string{"error": "只读模式，无法写入"}
+	}
+
+	var p struct {
+		Path          string `json:"path"`
+		ContentBase64 string `json:"content_base64"`
+		Overwrite     bool   `json:"overwrite"`
+	}
+	json.Unmarshal(params, &p)
+
+	if p.Path == "" {
+		return map[string]string{"error": "路径不能为空"}
+	}
+	if p.ContentBase64 == "" {
+		return map[string]string{"error": "content_base64 不能为空"}
+	}
+
+	path, err := a.safePath(p.Path)
+	if err != nil {
+		return map[string]string{"error": a.sanitizeError(err.Error())}
+	}
+	if a.isBlacklisted(path) {
+		return map[string]string{"error": "访问被拒绝"}
+	}
+
+	// 检查文件是否已存在
+	if !p.Overwrite {
+		if _, err := os.Stat(path); err == nil {
+			return map[string]string{"error": "文件已存在，设置 overwrite=true 覆盖"}
+		}
+	}
+
+	data, err := base64.StdEncoding.DecodeString(p.ContentBase64)
+	if err != nil {
+		return map[string]string{"error": "base64 解码失败: " + err.Error()}
+	}
+
+	os.MkdirAll(filepath.Dir(path), 0755)
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return map[string]string{"error": a.sanitizeError(err.Error())}
+	}
+
+	return map[string]interface{}{
+		"path":    a.relPath(path),
+		"size":    len(data),
+		"success": true,
+	}
+}
+
+// ─── 截图 ───
+
+func (a *Agent) screenshot(params json.RawMessage) interface{} {
+	tmpFile := filepath.Join(os.TempDir(), "cookclaw-screenshot.png")
+	defer os.Remove(tmpFile)
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("screencapture", "-x", tmpFile)
+	case "linux":
+		// 依次尝试多种截图工具
+		tools := []struct {
+			name string
+			args []string
+		}{
+			{"import", []string{"-window", "root", tmpFile}},
+			{"scrot", []string{tmpFile}},
+			{"gnome-screenshot", []string{"-f", tmpFile}},
+		}
+		for _, t := range tools {
+			if _, err := exec.LookPath(t.name); err == nil {
+				cmd = exec.Command(t.name, t.args...)
+				break
+			}
+		}
+		if cmd == nil {
+			return map[string]string{"error": "未找到截图工具（需要 import/scrot/gnome-screenshot）"}
+		}
+	case "windows":
+		// PowerShell 截图
+		psScript := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $s = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $b = New-Object System.Drawing.Bitmap($s.Width,$s.Height); $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen($s.Location,[System.Drawing.Point]::Empty,$s.Size); $b.Save('%s'); $g.Dispose(); $b.Dispose()`, tmpFile)
+		cmd = exec.Command("powershell", "-NoProfile", "-Command", psScript)
+	default:
+		return map[string]string{"error": fmt.Sprintf("不支持的平台: %s", runtime.GOOS)}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return map[string]string{"error": fmt.Sprintf("截图失败: %s %s", err.Error(), string(output))}
+	}
+
+	data, err := os.ReadFile(tmpFile)
+	if err != nil {
+		return map[string]string{"error": "读取截图失败: " + err.Error()}
+	}
+
+	// 获取图片尺寸
+	width, height := 0, 0
+	if img, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		width = img.Width
+		height = img.Height
+	}
+
+	return map[string]interface{}{
+		"width":          width,
+		"height":         height,
+		"format":         "png",
+		"size":           len(data),
+		"content_base64": base64.StdEncoding.EncodeToString(data),
+	}
+}
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -524,6 +700,12 @@ func (a *Agent) handleRequest(req Request) Response {
 		}
 	case "exec":
 		data = a.execCommand(req.Params)
+	case "upload_file":
+		data = a.uploadFile(req.Params)
+	case "download_file":
+		data = a.downloadFile(req.Params)
+	case "screenshot":
+		data = a.screenshot(req.Params)
 	default:
 		return Response{ID: req.ID, Success: false, Error: "未知操作: " + req.Action}
 	}

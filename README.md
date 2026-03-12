@@ -165,6 +165,26 @@ Bot: ⚡ python3 analyze.py (exit: 0, 2.3s)
 | `remote_file_info` | 文件详情 |
 | `remote_exec` | 执行命令 |
 | `remote_status` | Agent 状态 |
+| `remote_upload_file` | 读取二进制文件（base64） |
+| `remote_download_file` | 写入二进制文件（base64） |
+| `remote_screenshot` | 截取屏幕截图 |
+
+## 文件传输
+
+Agent 支持二进制文件的上传和下载，通过 base64 编码传输：
+
+- **上传** (`upload_file`): 从用户电脑读取任意文件，base64 编码返回。上限 50MB。只读模式下可用。
+- **下载** (`download_file`): 将 base64 编码的内容写入用户电脑。支持 overwrite 参数控制是否覆盖。只读模式下禁用。
+
+## 屏幕截图
+
+Agent 支持跨平台截图，自动检测并使用系统工具：
+
+- **macOS**: `screencapture`
+- **Linux**: `import` (ImageMagick) / `scrot` / `gnome-screenshot`（按顺序尝试）
+- **Windows**: PowerShell `System.Drawing`
+
+截图不受 `--readonly` 和 `--enable-exec` 限制（内置能力，不涉及用户文件或命令执行）。
 
 ## CI/CD
 
@@ -173,6 +193,6 @@ Bot: ⚡ python3 analyze.py (exit: 0, 2.3s)
 - 创建 GitHub Release 并附带所有二进制文件
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```

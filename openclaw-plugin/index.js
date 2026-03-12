@@ -220,6 +220,60 @@ const tools = {
       return `🦞 CookClaw Agent v${data.version}\n📁 目录: ${data.base_dir}\n🔒 只读: ${data.read_only ? '是' : '否'}\n⚡ 命令: ${data.exec_enabled ? '已启用' : '未启用'}\n💻 平台: ${data.platform}`;
     },
   },
+
+  remote_upload_file: {
+    description: '读取用户电脑上的二进制文件（base64 编码返回），支持任意文件类型，上限 50MB',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '文件路径（相对于 agent 根目录）' },
+      },
+      required: ['path'],
+    },
+    handler: async (params) => {
+      const result = await callAgent('upload_file', { path: params.path });
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
+      const data = result.data;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
+      return `📦 ${data.name}\n路径: ${data.path}\n大小: ${formatSize(data.size)}\n类型: ${data.mime_type}\n内容(base64): ${data.content_base64}`;
+    },
+  },
+
+  remote_download_file: {
+    description: '将二进制文件写入用户电脑（base64 编码传入），需要 agent 非只读模式',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '目标文件路径（相对于 agent 根目录）' },
+        content_base64: { type: 'string', description: '文件内容的 base64 编码' },
+        overwrite: { type: 'boolean', description: '是否覆盖已存在的文件（默认 false）' },
+      },
+      required: ['path', 'content_base64'],
+    },
+    handler: async (params) => {
+      const result = await callAgent('download_file', {
+        path: params.path,
+        content_base64: params.content_base64,
+        overwrite: params.overwrite || false,
+      });
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
+      const data = result.data;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
+      return `✅ 已写入 ${data.path} (${formatSize(data.size)})`;
+    },
+  },
+
+  remote_screenshot: {
+    description: '截取用户电脑的屏幕截图（返回 base64 编码的 PNG 图片）',
+    parameters: { type: 'object', properties: {} },
+    handler: async () => {
+      const result = await callAgent('screenshot', {});
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
+      const data = result.data;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
+      return `📸 截图 ${data.width}x${data.height} (${data.format}, ${formatSize(data.size)})\n内容(base64): ${data.content_base64}`;
+    },
+  },
 };
 
 function formatSize(bytes) {
@@ -242,7 +296,7 @@ function startStdioServer() {
     params: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'cookclaw-remote-files', version: '0.2.0' },
+      serverInfo: { name: 'cookclaw-remote-files', version: '0.3.0' },
     },
   }) + '\n');
 
@@ -291,7 +345,7 @@ function startStdioServer() {
           result: {
             protocolVersion: '2024-11-05',
             capabilities: { tools: {} },
-            serverInfo: { name: 'cookclaw-remote-files', version: '0.2.0' },
+            serverInfo: { name: 'cookclaw-remote-files', version: '0.3.0' },
           },
         }) + '\n');
       }
