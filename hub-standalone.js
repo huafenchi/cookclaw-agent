@@ -27,16 +27,72 @@ function getArg(name, def) {
 const PORT = parseInt(getArg('port', '3006'));
 const SECRET = getArg('secret', crypto.randomBytes(16).toString('hex'));
 const AGENT_KEY = getArg('agent-key', crypto.randomBytes(24).toString('hex'));
+const REQUEST_TIMEOUT = parseInt(process.env.HUB_REQUEST_TIMEOUT || '30000');
 
 // ─── Agent 连接管理 ───
 let agentWs = null;
 let agentInfo = {};
 const pending = new Map(); // requestId → { resolve, timeout }
-const REQUEST_TIMEOUT = 30000;
 
-function sendToAgent(action, params) {
+// ─── 速率限制: 60 请求/分钟/IP ───
+const RATE_LIMIT = 60;
+const RATE_WINDOW = 60000; // 1 分钟
+const rateCounts = new Map(); // ip → { count, resetAt }
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  let entry = rateCounts.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_WINDOW };
+    rateCounts.set(ip, entry);
+  }
+  entry.count++;
+  return entry.count <= RATE_LIMIT;
+}
+
+// 定期清理过期的速率限制条目
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateCounts) {
+    if (now >= entry.resetAt) rateCounts.delete(ip);
+  }
+}, RATE_WINDOW);
+
+// ─── 请求缓冲: agent 离线时等待最多 5 秒重连 ───
+const RECONNECT_WAIT = 5000;
+const reconnectWaiters = []; // [{ resolve, reject, timer }]
+
+function notifyReconnectWaiters() {
+  while (reconnectWaiters.length > 0) {
+    const w = reconnectWaiters.shift();
+    clearTimeout(w.timer);
+    w.resolve();
+  }
+}
+
+function waitForReconnect() {
   return new Promise((resolve, reject) => {
-    if (!agentWs || agentWs.readyState !== WebSocket.OPEN) {
+    const timer = setTimeout(() => {
+      const idx = reconnectWaiters.findIndex(w => w.timer === timer);
+      if (idx >= 0) reconnectWaiters.splice(idx, 1);
+      reject(new Error('Agent 不在线（等待重连超时）'));
+    }, RECONNECT_WAIT);
+    reconnectWaiters.push({ resolve, reject, timer });
+  });
+}
+
+function isAgentOnline() {
+  return agentWs && agentWs.readyState === WebSocket.OPEN;
+}
+
+async function sendToAgent(action, params) {
+  // 如果 agent 离线，等待短暂重连窗口
+  if (!isAgentOnline()) {
+    await waitForReconnect();
+  }
+
+  return new Promise((resolve, reject) => {
+    if (!isAgentOnline()) {
       reject(new Error('Agent 不在线'));
       return;
     }
@@ -61,13 +117,21 @@ const server = http.createServer((req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
     res.end(JSON.stringify({
       status: 'ok',
-      agentOnline: !!(agentWs && agentWs.readyState === WebSocket.OPEN),
+      agentOnline: isAgentOnline(),
       agentInfo,
     }));
     return;
   }
 
   if (req.url === '/request' && req.method === 'POST') {
+    // 速率限制
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
+    if (!checkRateLimit(ip)) {
+      res.writeHead(429);
+      res.end(JSON.stringify({ success: false, error: 'Rate limit exceeded (60/min)' }));
+      return;
+    }
+
     let body = '';
     req.on('data', c => body += c);
     req.on('end', async () => {
@@ -112,6 +176,9 @@ server.on('upgrade', (req, socket, head) => {
       agentWs = ws;
       console.log('✅ Agent 已连接');
 
+      // 通知等待重连的请求
+      notifyReconnectWaiters();
+
       ws.on('message', (data) => {
         try {
           const msg = JSON.parse(data.toString());
@@ -143,6 +210,7 @@ server.on('upgrade', (req, socket, head) => {
 
       ws.on('close', () => {
         agentWs = null;
+        // 清除 agentInfo 防止返回过期数据
         agentInfo = {};
         console.log('🔌 Agent 断开连接');
       });
@@ -160,6 +228,8 @@ server.listen(PORT, '0.0.0.0', () => {
 端口:       ${PORT}
 Secret:     ${SECRET}
 Agent Key:  ${AGENT_KEY}
+超时:       ${REQUEST_TIMEOUT}ms
+速率限制:   ${RATE_LIMIT} 请求/分钟/IP
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

@@ -19,6 +19,23 @@ const API_URL = process.env.COOKCLAW_API_URL || 'http://host.docker.internal:300
 const BOT_ID = process.env.COOKCLAW_BOT_ID || '';
 const SECRET = process.env.COOKCLAW_SECRET || 'cookclaw-worker-2026';
 
+// 清理错误消息：去除内部路径和 IP 地址，避免泄露给 LLM
+function sanitizeError(msg) {
+  if (!msg || typeof msg !== 'string') return msg;
+  return msg
+    // 去除绝对路径 (Unix)
+    .replace(/\/(?:home|Users|opt|var|etc|tmp|root)\/[^\s,)}\]"']*/g, '<path>')
+    // 去除 Windows 路径
+    .replace(/[A-Z]:\\[^\s,)}\]"']*/gi, '<path>')
+    // 去除 IPv4 地址（含端口）
+    .replace(/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?/g, '<host>')
+    // 去除 IPv6 地址
+    .replace(/\[?[0-9a-fA-F:]{3,39}\]?(:\d+)?/g, (match) => {
+      // 只替换看起来像 IPv6 的（至少两个冒号）
+      return (match.match(/:/g) || []).length >= 2 ? '<host>' : match;
+    });
+}
+
 // 调用 Hub 转发请求到 agent
 // 兼容两种模式：CookClaw API (/api/agent/request + botId) 和独立 Hub (/request)
 function callAgent(action, params) {
@@ -56,7 +73,7 @@ function callAgent(action, params) {
       });
     });
 
-    req.on('error', e => reject(e));
+    req.on('error', e => reject(new Error(sanitizeError(e.message))));
     req.on('timeout', () => { req.destroy(); reject(new Error('请求超时')); });
     req.write(data);
     req.end();
@@ -76,9 +93,9 @@ const tools = {
     },
     handler: async (params) => {
       const result = await callAgent('list_dir', { path: params.path || '.' });
-      if (!result.success) return `错误: ${result.error}`;
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
       const data = result.data;
-      if (data.error) return `错误: ${data.error}`;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
       const files = data.files || [];
       if (files.length === 0) return `目录 ${data.dir} 为空`;
       const lines = files.map(f => 
@@ -101,9 +118,9 @@ const tools = {
     },
     handler: async (params) => {
       const result = await callAgent('read_file', params);
-      if (!result.success) return `错误: ${result.error}`;
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
       const data = result.data;
-      if (data.error) return `错误: ${data.error}`;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
       return `📄 ${data.path} (${formatSize(data.size)}, ${data.mod_time})\n\n${data.content}`;
     },
   },
@@ -121,9 +138,9 @@ const tools = {
     },
     handler: async (params) => {
       const result = await callAgent('write_file', params);
-      if (!result.success) return `错误: ${result.error}`;
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
       const data = result.data;
-      if (data.error) return `错误: ${data.error}`;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
       return `✅ 已写入 ${data.path} (${data.written} 字节)`;
     },
   },
@@ -141,9 +158,9 @@ const tools = {
     },
     handler: async (params) => {
       const result = await callAgent('search', params);
-      if (!result.success) return `错误: ${result.error}`;
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
       const data = result.data;
-      if (data.error) return `错误: ${data.error}`;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
       const results = data.results || [];
       if (results.length === 0) return `未找到匹配 "${data.query}" 的文件`;
       const lines = results.map(f =>
@@ -164,9 +181,9 @@ const tools = {
     },
     handler: async (params) => {
       const result = await callAgent('file_info', params);
-      if (!result.success) return `错误: ${result.error}`;
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
       const data = result.data;
-      if (data.error) return `错误: ${data.error}`;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
       return `${data.is_dir ? '📁' : '📄'} ${data.name}\n路径: ${data.path}\n大小: ${formatSize(data.size)}\n修改时间: ${data.mod_time}\n类型: ${data.is_dir ? '目录' : '文件'}`;
     },
   },
@@ -183,9 +200,9 @@ const tools = {
     },
     handler: async (params) => {
       const result = await callAgent('exec', params);
-      if (!result.success) return `错误: ${result.error}`;
+      if (!result.success) return `错误: ${sanitizeError(result.error)}`;
       const data = result.data;
-      if (data.error) return `错误: ${data.error}`;
+      if (data.error) return `错误: ${sanitizeError(data.error)}`;
       let output = '';
       if (data.stdout) output += data.stdout;
       if (data.stderr) output += (output ? '\n--- stderr ---\n' : '') + data.stderr;
@@ -198,7 +215,7 @@ const tools = {
     parameters: { type: 'object', properties: {} },
     handler: async () => {
       const result = await callAgent('status', {});
-      if (!result.success) return `Agent 不在线: ${result.error}`;
+      if (!result.success) return `Agent 不在线: ${sanitizeError(result.error)}`;
       const data = result.data;
       return `🦞 CookClaw Agent v${data.version}\n📁 目录: ${data.base_dir}\n🔒 只读: ${data.read_only ? '是' : '否'}\n⚡ 命令: ${data.exec_enabled ? '已启用' : '未启用'}\n💻 平台: ${data.platform}`;
     },
@@ -225,7 +242,7 @@ function startStdioServer() {
     params: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'cookclaw-remote-files', version: '0.1.0' },
+      serverInfo: { name: 'cookclaw-remote-files', version: '0.2.0' },
     },
   }) + '\n');
 
@@ -265,7 +282,7 @@ function startStdioServer() {
         } catch (e) {
           process.stdout.write(JSON.stringify({
             jsonrpc: '2.0', id: msg.id,
-            result: { content: [{ type: 'text', text: '调用失败: ' + e.message }], isError: true },
+            result: { content: [{ type: 'text', text: '调用失败: ' + sanitizeError(e.message) }], isError: true },
           }) + '\n');
         }
       } else if (msg.method === 'initialize') {
@@ -274,7 +291,7 @@ function startStdioServer() {
           result: {
             protocolVersion: '2024-11-05',
             capabilities: { tools: {} },
-            serverInfo: { name: 'cookclaw-remote-files', version: '0.1.0' },
+            serverInfo: { name: 'cookclaw-remote-files', version: '0.2.0' },
           },
         }) + '\n');
       }
@@ -311,7 +328,7 @@ function startHttpServer() {
           res.end(JSON.stringify({ success: true, result }));
         } catch (e) {
           res.writeHead(500);
-          res.end(JSON.stringify({ error: e.message }));
+          res.end(JSON.stringify({ error: sanitizeError(e.message) }));
         }
       });
       return;

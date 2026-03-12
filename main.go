@@ -22,10 +22,10 @@ import (
 )
 
 const (
-	Version        = "0.1.0"
-	MaxFileSize    = 10 * 1024 * 1024 // 10MB
-	HeartbeatEvery = 30 * time.Second
-	ReconnectDelay = 5 * time.Second
+	Version          = "0.2.0"
+	MaxFileSize      = 10 * 1024 * 1024 // 10MB
+	HeartbeatEvery   = 30 * time.Second
+	ReconnectDelay   = 5 * time.Second
 	MaxSearchResults = 100
 )
 
@@ -46,16 +46,32 @@ var defaultDenyCommands = []string{
 	"nc -l", "ncat -l", // 反弹 shell
 }
 
+// ConfigFile 对应 --config JSON 文件格式
+type ConfigFile struct {
+	Server         string   `json:"server"`
+	Key            string   `json:"key"`
+	Dir            string   `json:"dir"`
+	ReadOnly       bool     `json:"readonly"`
+	EnableExec     bool     `json:"enable_exec"`
+	AllowCommands  []string `json:"allow_commands"`
+	DenyCommands   []string `json:"deny_commands"`
+	ExecTimeout    int      `json:"exec_timeout"`
+	AllowAllCmds   bool     `json:"allow_all_commands"`
+	MaxSearchDepth int      `json:"max_search_depth"`
+}
+
 type Config struct {
-	ServerURL     string
-	Key           string
-	BaseDir       string
-	ReadOnly      bool
-	Verbose       bool
-	EnableExec    bool
-	AllowCommands []string // 白名单（空=允许所有非黑名单）
-	DenyCommands  []string // 黑名单
-	ExecTimeout   time.Duration
+	ServerURL      string
+	Key            string
+	BaseDir        string
+	ReadOnly       bool
+	Verbose        bool
+	EnableExec     bool
+	AllowAllCmds   bool     // 显式允许所有非黑名单命令
+	AllowCommands  []string // 白名单（空且无 AllowAllCmds = 拒绝所有）
+	DenyCommands   []string // 黑名单
+	ExecTimeout    time.Duration
+	MaxSearchDepth int
 }
 
 type Request struct {
@@ -89,19 +105,21 @@ func NewAgent(config *Config) *Agent {
 	return &Agent{config: config, done: make(chan struct{})}
 }
 
+// sanitizeError 从错误消息中去除 baseDir 绝对路径前缀
+func (a *Agent) sanitizeError(msg string) string {
+	return strings.ReplaceAll(msg, a.config.BaseDir, "<root>")
+}
+
 // ─── 安全检查 ───
 
 func (a *Agent) safePath(reqPath string) (string, error) {
-	// 解析路径
 	cleaned := filepath.Clean(reqPath)
 	if filepath.IsAbs(cleaned) {
-		// 绝对路径：必须在 baseDir 下
 		if !strings.HasPrefix(cleaned, a.config.BaseDir) {
 			return "", fmt.Errorf("路径越界")
 		}
 		return cleaned, nil
 	}
-	// 相对路径：拼接 baseDir
 	full := filepath.Clean(filepath.Join(a.config.BaseDir, cleaned))
 	if !strings.HasPrefix(full, a.config.BaseDir) {
 		return "", fmt.Errorf("路径越界")
@@ -140,7 +158,7 @@ func (a *Agent) listDir(params json.RawMessage) interface{} {
 
 	dir, err := a.safePath(p.Path)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 	if a.isBlacklisted(dir) {
 		return map[string]string{"error": "访问被拒绝"}
@@ -148,7 +166,7 @@ func (a *Agent) listDir(params json.RawMessage) interface{} {
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 
 	files := make([]FileInfo, 0, len(entries))
@@ -181,7 +199,7 @@ func (a *Agent) readFile(params json.RawMessage) interface{} {
 
 	path, err := a.safePath(p.Path)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 	if a.isBlacklisted(path) {
 		return map[string]string{"error": "访问被拒绝"}
@@ -189,7 +207,7 @@ func (a *Agent) readFile(params json.RawMessage) interface{} {
 
 	info, err := os.Stat(path)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 	if info.IsDir() {
 		return map[string]string{"error": "这是一个目录"}
@@ -200,7 +218,7 @@ func (a *Agent) readFile(params json.RawMessage) interface{} {
 
 	f, err := os.Open(path)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 	defer f.Close()
 
@@ -216,7 +234,7 @@ func (a *Agent) readFile(params json.RawMessage) interface{} {
 	data := make([]byte, limit)
 	n, err := f.Read(data)
 	if err != nil && err != io.EOF {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 
 	return map[string]interface{}{
@@ -241,31 +259,30 @@ func (a *Agent) writeFile(params json.RawMessage) interface{} {
 
 	path, err := a.safePath(p.Path)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 	if a.isBlacklisted(path) {
 		return map[string]string{"error": "访问被拒绝"}
 	}
 
-	// 确保目录存在
 	os.MkdirAll(filepath.Dir(path), 0755)
 
-	flag := os.O_WRONLY | os.O_CREATE
+	flg := os.O_WRONLY | os.O_CREATE
 	if p.Append {
-		flag |= os.O_APPEND
+		flg |= os.O_APPEND
 	} else {
-		flag |= os.O_TRUNC
+		flg |= os.O_TRUNC
 	}
 
-	f, err := os.OpenFile(path, flag, 0644)
+	f, err := os.OpenFile(path, flg, 0644)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 	defer f.Close()
 
 	n, err := f.WriteString(p.Content)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 
 	return map[string]interface{}{"written": n, "path": a.relPath(path)}
@@ -273,17 +290,21 @@ func (a *Agent) writeFile(params json.RawMessage) interface{} {
 
 func (a *Agent) searchFiles(params json.RawMessage) interface{} {
 	var p struct {
-		Query     string `json:"query"`
-		MaxDepth  int    `json:"max_depth"`
-		FileOnly  bool   `json:"file_only"`
+		Query    string `json:"query"`
+		MaxDepth int    `json:"max_depth"`
+		FileOnly bool   `json:"file_only"`
 	}
 	json.Unmarshal(params, &p)
 
 	if p.Query == "" {
 		return map[string]string{"error": "搜索关键词不能为空"}
 	}
+	// 使用请求中的 max_depth，但不超过全局 MaxSearchDepth 限制
 	if p.MaxDepth == 0 {
 		p.MaxDepth = 5
+	}
+	if p.MaxDepth > a.config.MaxSearchDepth {
+		p.MaxDepth = a.config.MaxSearchDepth
 	}
 
 	query := strings.ToLower(p.Query)
@@ -339,7 +360,7 @@ func (a *Agent) fileInfo(params json.RawMessage) interface{} {
 
 	path, err := a.safePath(p.Path)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 	if a.isBlacklisted(path) {
 		return map[string]string{"error": "访问被拒绝"}
@@ -347,7 +368,7 @@ func (a *Agent) fileInfo(params json.RawMessage) interface{} {
 
 	info, err := os.Stat(path)
 	if err != nil {
-		return map[string]string{"error": err.Error()}
+		return map[string]string{"error": a.sanitizeError(err.Error())}
 	}
 
 	return FileInfo{
@@ -368,10 +389,10 @@ func (a *Agent) isCommandAllowed(command string) (bool, string) {
 
 	lower := strings.ToLower(strings.TrimSpace(command))
 
-	// 黑名单检查
+	// 黑名单检查（始终生效）
 	for _, deny := range a.config.DenyCommands {
 		if strings.Contains(lower, strings.ToLower(deny)) {
-			return false, "命令被禁止: 匹配黑名单规则 '" + deny + "'"
+			return false, "命令被禁止: 匹配黑名单规则"
 		}
 	}
 	for _, deny := range defaultDenyCommands {
@@ -380,12 +401,10 @@ func (a *Agent) isCommandAllowed(command string) (bool, string) {
 		}
 	}
 
-	// 白名单检查（如果设了白名单，命令必须以白名单中的某个开头）
+	// 白名单检查：如果设了白名单，命令必须匹配
 	if len(a.config.AllowCommands) > 0 {
 		allowed := false
-		// 提取命令名（第一个词）
 		cmdName := strings.Fields(lower)[0]
-		// 去掉路径，只看命令名
 		cmdName = filepath.Base(cmdName)
 		for _, allow := range a.config.AllowCommands {
 			if cmdName == strings.ToLower(allow) {
@@ -394,8 +413,11 @@ func (a *Agent) isCommandAllowed(command string) (bool, string) {
 			}
 		}
 		if !allowed {
-			return false, "命令不在白名单中（允许: " + strings.Join(a.config.AllowCommands, ", ") + "）"
+			return false, "命令不在白名单中"
 		}
+	} else if !a.config.AllowAllCmds {
+		// 没有白名单且没有 --allow-all-commands：默认拒绝
+		return false, "未配置命令白名单（使用 --allow-commands 或 --allow-all-commands）"
 	}
 
 	return true, ""
@@ -404,7 +426,7 @@ func (a *Agent) isCommandAllowed(command string) (bool, string) {
 func (a *Agent) execCommand(params json.RawMessage) interface{} {
 	var p struct {
 		Command string `json:"command"`
-		Timeout int    `json:"timeout"` // 秒，默认30
+		Timeout int    `json:"timeout"`
 	}
 	json.Unmarshal(params, &p)
 
@@ -454,7 +476,7 @@ func (a *Agent) execCommand(params json.RawMessage) interface{} {
 				"exit_code": -1,
 			}
 		} else {
-			return map[string]string{"error": "执行失败: " + err.Error()}
+			return map[string]string{"error": a.sanitizeError("执行失败: " + err.Error())}
 		}
 	}
 
@@ -494,11 +516,11 @@ func (a *Agent) handleRequest(req Request) Response {
 		data = a.fileInfo(req.Params)
 	case "status":
 		data = map[string]interface{}{
-			"version":    Version,
-			"base_dir":   a.config.BaseDir,
-			"read_only":  a.config.ReadOnly,
+			"version":      Version,
+			"base_dir":     a.config.BaseDir,
+			"read_only":    a.config.ReadOnly,
 			"exec_enabled": a.config.EnableExec,
-			"platform":   runtime.GOOS + "/" + runtime.GOARCH,
+			"platform":     runtime.GOOS + "/" + runtime.GOARCH,
 		}
 	case "exec":
 		data = a.execCommand(req.Params)
@@ -609,7 +631,6 @@ func (a *Agent) heartbeat() {
 }
 
 func (a *Agent) Run() {
-	// 信号处理
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 
@@ -642,6 +663,19 @@ func (a *Agent) Run() {
 	}
 }
 
+// loadConfigFile 从 JSON 文件加载配置（CLI flags 优先）
+func loadConfigFile(path string) (*ConfigFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取配置文���失败: %w", err)
+	}
+	var cf ConfigFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+	return &cf, nil
+}
+
 func main() {
 	serverURL := flag.String("server", "wss://cookclaw.com/ws/agent", "CookClaw 服务器地址")
 	key := flag.String("key", "", "Agent 连接密钥（在 CookClaw 后台获取）")
@@ -653,12 +687,58 @@ func main() {
 	execTimeout := flag.Int("exec-timeout", 60, "命令执行超时秒数")
 	verbose := flag.Bool("v", false, "显示详细日志")
 	showVersion := flag.Bool("version", false, "显示版本号")
+	configPath := flag.String("config", "", "JSON 配置文件路径（CLI 参数优先）")
+	allowAllCmds := flag.Bool("allow-all-commands", false, "允许所有非黑名单命令（需配合 --enable-exec）")
+	maxSearchDepth := flag.Int("max-search-depth", 10, "搜索文件最大深度")
 
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("cookclaw-agent v%s\n", Version)
 		return
+	}
+
+	// 加载配置文件（如果指定）
+	var cf *ConfigFile
+	if *configPath != "" {
+		var err error
+		cf, err = loadConfigFile(*configPath)
+		if err != nil {
+			log.Fatalf("❌ %v", err)
+		}
+		log.Printf("📄 已加载配置文件: %s", *configPath)
+	}
+
+	// 合并配置：CLI flags 优先，配置文件作为默认值
+	// 检查哪些 flag 被用户显式设置了
+	flagSet := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { flagSet[f.Name] = true })
+
+	if cf != nil {
+		if !flagSet["server"] && cf.Server != "" {
+			*serverURL = cf.Server
+		}
+		if !flagSet["key"] && cf.Key != "" {
+			*key = cf.Key
+		}
+		if !flagSet["dir"] && cf.Dir != "" {
+			*dir = cf.Dir
+		}
+		if !flagSet["readonly"] && cf.ReadOnly {
+			*readOnly = true
+		}
+		if !flagSet["enable-exec"] && cf.EnableExec {
+			*enableExec = true
+		}
+		if !flagSet["exec-timeout"] && cf.ExecTimeout > 0 {
+			*execTimeout = cf.ExecTimeout
+		}
+		if !flagSet["allow-all-commands"] && cf.AllowAllCmds {
+			*allowAllCmds = true
+		}
+		if !flagSet["max-search-depth"] && cf.MaxSearchDepth > 0 {
+			*maxSearchDepth = cf.MaxSearchDepth
+		}
 	}
 
 	if *key == "" {
@@ -692,6 +772,10 @@ func main() {
 			}
 		}
 	}
+	// 从配置文件合并（不覆盖 CLI）
+	if cf != nil && len(allowList) == 0 && len(cf.AllowCommands) > 0 {
+		allowList = cf.AllowCommands
+	}
 	if *denyCmds != "" {
 		for _, c := range strings.Split(*denyCmds, ",") {
 			if t := strings.TrimSpace(c); t != "" {
@@ -699,17 +783,22 @@ func main() {
 			}
 		}
 	}
+	if cf != nil && len(denyList) == 0 && len(cf.DenyCommands) > 0 {
+		denyList = cf.DenyCommands
+	}
 
 	config := &Config{
-		ServerURL:     *serverURL,
-		Key:           *key,
-		BaseDir:       absDir,
-		ReadOnly:      *readOnly,
-		Verbose:       *verbose,
-		EnableExec:    *enableExec,
-		AllowCommands: allowList,
-		DenyCommands:  denyList,
-		ExecTimeout:   time.Duration(*execTimeout) * time.Second,
+		ServerURL:      *serverURL,
+		Key:            *key,
+		BaseDir:        absDir,
+		ReadOnly:       *readOnly,
+		Verbose:        *verbose,
+		EnableExec:     *enableExec,
+		AllowAllCmds:   *allowAllCmds,
+		AllowCommands:  allowList,
+		DenyCommands:   denyList,
+		ExecTimeout:    time.Duration(*execTimeout) * time.Second,
+		MaxSearchDepth: *maxSearchDepth,
 	}
 
 	fmt.Printf("🦞 CookClaw Agent v%s\n", Version)
@@ -723,6 +812,10 @@ func main() {
 		fmt.Printf("⚡ 命令执行: 已启用")
 		if len(allowList) > 0 {
 			fmt.Printf("（白名单: %s）", strings.Join(allowList, ", "))
+		} else if config.AllowAllCmds {
+			fmt.Printf("（允许所有非黑名单命令）")
+		} else {
+			fmt.Printf("（⚠️ 未配置白名单，需 --allow-commands 或 --allow-all-commands）")
 		}
 		fmt.Println()
 	}

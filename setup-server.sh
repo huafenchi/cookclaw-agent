@@ -4,7 +4,15 @@
 
 set -e
 
-echo "🦞 CookClaw Agent Hub — 服务器端部署"
+SETUP_VERSION="0.2.0"
+
+# --version 支持
+if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
+  echo "cookclaw-agent setup v${SETUP_VERSION}"
+  exit 0
+fi
+
+echo "🦞 CookClaw Agent Hub — 服务器端部署 v${SETUP_VERSION}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
@@ -53,6 +61,32 @@ npm install ws 2>/dev/null || npm init -y && npm install ws
 AGENT_KEY=$(openssl rand -hex 24 2>/dev/null || head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n')
 HUB_SECRET=$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 HUB_PORT="${COOKCLAW_PORT:-3006}"
+
+# 端口可用性检查
+if command -v ss &>/dev/null; then
+  if ss -tlnp 2>/dev/null | grep -q ":${HUB_PORT} "; then
+    echo "⚠️  端口 ${HUB_PORT} 已被占用:"
+    ss -tlnp 2>/dev/null | grep ":${HUB_PORT} " | head -3
+    echo ""
+    echo "请用 COOKCLAW_PORT=其他端口 重新运行，或先停止占用进程"
+    exit 1
+  fi
+elif command -v lsof &>/dev/null; then
+  if lsof -iTCP:${HUB_PORT} -sTCP:LISTEN &>/dev/null; then
+    echo "⚠️  端口 ${HUB_PORT} 已被占用:"
+    lsof -iTCP:${HUB_PORT} -sTCP:LISTEN 2>/dev/null | head -5
+    echo ""
+    echo "请用 COOKCLAW_PORT=其他端口 重新运行，或先停止占用进程"
+    exit 1
+  fi
+elif command -v netstat &>/dev/null; then
+  if netstat -tlnp 2>/dev/null | grep -q ":${HUB_PORT} "; then
+    echo "⚠️  端口 ${HUB_PORT} 已被占用"
+    echo "请用 COOKCLAW_PORT=其他端口 重新运行，或先停止占用进程"
+    exit 1
+  fi
+fi
+echo "✅ 端口 ${HUB_PORT} 可用"
 
 # 保存配置
 cat > config.env << ENVEOF
